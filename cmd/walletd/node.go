@@ -2,226 +2,320 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"log"
+	"fmt"
 	"net"
+	"net/http"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
-	"go.sia.tech/core/chain"
 	"go.sia.tech/core/consensus"
 	"go.sia.tech/core/gateway"
 	"go.sia.tech/core/types"
-	"go.sia.tech/walletd/internal/syncerutil"
-	"go.sia.tech/walletd/internal/walletutil"
-	"go.sia.tech/walletd/syncer"
+	"go.sia.tech/coreutils"
+	"go.sia.tech/coreutils/chain"
+	"go.sia.tech/coreutils/syncer"
+	"go.sia.tech/walletd/v2/api"
+	"go.sia.tech/walletd/v2/build"
+	"go.sia.tech/walletd/v2/config"
+	"go.sia.tech/walletd/v2/persist/sqlite"
+	"go.sia.tech/walletd/v2/wallet"
+	"go.sia.tech/web/walletd"
+	"go.uber.org/zap"
 	"lukechampine.com/upnp"
 )
 
-var mainnetBootstrap = []string{
-	"108.227.62.195:9981",
-	"139.162.81.190:9991",
-	"144.217.7.188:9981",
-	"147.182.196.252:9981",
-	"15.235.85.30:9981",
-	"167.235.234.84:9981",
-	"173.235.144.230:9981",
-	"198.98.53.144:7791",
-	"199.27.255.169:9981",
-	"2.136.192.200:9981",
-	"213.159.50.43:9981",
-	"24.253.116.61:9981",
-	"46.249.226.103:9981",
-	"5.165.236.113:9981",
-	"5.252.226.131:9981",
-	"54.38.120.222:9981",
-	"62.210.136.25:9981",
-	"63.135.62.123:9981",
-	"65.21.93.245:9981",
-	"75.165.149.114:9981",
-	"77.51.200.125:9981",
-	"81.6.58.121:9981",
-	"83.194.193.156:9981",
-	"84.39.246.63:9981",
-	"87.99.166.34:9981",
-	"91.214.242.11:9981",
-	"93.105.88.181:9981",
-	"93.180.191.86:9981",
-	"94.130.220.162:9981",
+func tryConfigPaths() []string {
+	if str := os.Getenv(configFileEnvVar); str != "" {
+		return []string{str}
+	}
+
+	paths := []string{
+		"walletd.yml",
+	}
+	if str := os.Getenv(dataDirEnvVar); str != "" {
+		paths = append(paths, filepath.Join(str, "walletd.yml"))
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		paths = append(paths, filepath.Join(os.Getenv("APPDATA"), "walletd", "walletd.yml"))
+	case "darwin":
+		paths = append(paths, filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "walletd", "walletd.yml"))
+	case "linux", "freebsd", "openbsd":
+		paths = append(paths,
+			filepath.Join(string(filepath.Separator), "etc", "walletd", "walletd.yml"),
+			filepath.Join(string(filepath.Separator), "var", "lib", "walletd", "walletd.yml"), // old default for the Linux service
+		)
+	}
+	return paths
 }
 
-var zenBootstrap = []string{
-	"147.135.16.182:9881",
-	"147.135.39.109:9881",
-	"51.81.208.10:9881",
+func defaultDataDirectory(fp string) string {
+	// use the provided path if it's not empty
+	if fp != "" {
+		return fp
+	}
+
+	// check for databases in the current directory
+	if _, err := os.Stat("walletd.db"); err == nil {
+		return "."
+	} else if _, err := os.Stat("walletd.sqlite3"); err == nil {
+		return "."
+	}
+
+	// default to the operating system's application directory
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(os.Getenv("APPDATA"), "walletd")
+	case "darwin":
+		return filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "walletd")
+	case "linux", "freebsd", "openbsd":
+		return filepath.Join(string(filepath.Separator), "var", "lib", "walletd")
+	default:
+		return "."
+	}
 }
 
-type boltDB struct {
-	tx *bolt.Tx
-	db *bolt.DB
+func setupUPNP(ctx context.Context, port uint16, log *zap.Logger) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	d, err := upnp.Discover(ctx)
+	if err != nil {
+		return "", fmt.Errorf("couldn't discover UPnP router: %w", err)
+	} else if !d.IsForwarded(port, "TCP") {
+		if err := d.Forward(uint16(port), "TCP", "walletd"); err != nil {
+			log.Debug("couldn't forward port", zap.Error(err))
+		} else {
+			log.Debug("upnp: forwarded p2p port", zap.Uint16("port", port))
+		}
+	}
+	return d.ExternalIP()
 }
 
-func (db *boltDB) newTx() (err error) {
-	if db.tx == nil {
-		db.tx, err = db.db.Begin(true)
+// startLocalhostListener https://github.com/SiaFoundation/hostd/issues/202
+func startLocalhostListener(listenAddr string, log *zap.Logger) (l net.Listener, err error) {
+	addr, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse API address: %w", err)
+	}
+
+	// if the address is not localhost, listen on the address as-is
+	if addr != "localhost" {
+		return net.Listen("tcp", listenAddr)
+	}
+
+	// localhost fails on some new installs of Windows 11, so try a few
+	// different addresses
+	tryAddresses := []string{
+		net.JoinHostPort("localhost", port), // original address
+		net.JoinHostPort("127.0.0.1", port), // IPv4 loopback
+		net.JoinHostPort("::1", port),       // IPv6 loopback
+	}
+
+	for _, addr := range tryAddresses {
+		l, err = net.Listen("tcp", addr)
+		if err == nil {
+			return
+		}
+		log.Debug("failed to listen on fallback address", zap.String("address", addr), zap.Error(err))
 	}
 	return
 }
 
-func (db *boltDB) Bucket(name []byte) chain.DBBucket {
-	if err := db.newTx(); err != nil {
-		panic(err)
+func loadCustomNetwork(fp string) (*consensus.Network, types.Block, error) {
+	f, err := os.Open(fp)
+	if err != nil {
+		return nil, types.Block{}, fmt.Errorf("failed to open network file: %w", err)
+	}
+	defer f.Close()
+
+	var network struct {
+		Network consensus.Network `json:"network" yaml:"network"`
+		Genesis types.Block       `json:"genesis" yaml:"genesis"`
 	}
 
-	b := db.tx.Bucket(name)
-	if b == nil {
-		return nil
+	if err := json.NewDecoder(f).Decode(&network); err != nil {
+		return nil, types.Block{}, fmt.Errorf("failed to decode JSON network file: %w", err)
 	}
-	return b
+	return &network.Network, network.Genesis, nil
 }
 
-func (db *boltDB) CreateBucket(name []byte) (chain.DBBucket, error) {
-	if err := db.newTx(); err != nil {
-		return nil, err
+func runNode(ctx context.Context, cfg config.Config, log *zap.Logger) error {
+	store, err := sqlite.OpenDatabase(filepath.Join(cfg.Directory, "walletd.sqlite3"), sqlite.WithLog(log.Named("sqlite3")))
+	if err != nil {
+		return fmt.Errorf("failed to open wallet database: %w", err)
 	}
+	defer store.Close()
 
-	b, err := db.tx.CreateBucket(name)
-	if b == nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-func (db *boltDB) Flush() error {
-	if db.tx == nil {
-		return nil
-	}
-
-	if err := db.tx.Commit(); err != nil {
-		return err
-	}
-	db.tx = nil
-	return nil
-}
-
-func (db *boltDB) Cancel() {
-	if db.tx == nil {
-		return
-	}
-
-	db.tx.Rollback()
-	db.tx = nil
-}
-
-func (db *boltDB) Close() error {
-	db.Flush()
-	return db.db.Close()
-}
-
-type node struct {
-	cm *chain.Manager
-	s  *syncer.Syncer
-	wm *walletutil.JSONWalletManager
-
-	Start func() (stop func())
-}
-
-func newNode(addr, dir string, chainNetwork string, useUPNP bool) (*node, error) {
 	var network *consensus.Network
 	var genesisBlock types.Block
 	var bootstrapPeers []string
-	switch chainNetwork {
+	switch cfg.Consensus.Network {
 	case "mainnet":
 		network, genesisBlock = chain.Mainnet()
-		bootstrapPeers = mainnetBootstrap
+		bootstrapPeers = syncer.MainnetBootstrapPeers
 	case "zen":
 		network, genesisBlock = chain.TestnetZen()
-		bootstrapPeers = zenBootstrap
+		bootstrapPeers = syncer.ZenBootstrapPeers
 	default:
-		return nil, errors.New("invalid network: must be one of 'mainnet' or 'zen'")
-	}
-
-	bdb, err := bolt.Open(filepath.Join(dir, "consensus.db"), 0600, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	db := &boltDB{db: bdb}
-	dbstore, tipState, err := chain.NewDBStore(db, network, genesisBlock)
-	if err != nil {
-		return nil, err
-	}
-	cm := chain.NewManager(dbstore, tipState)
-
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	syncerAddr := l.Addr().String()
-	if useUPNP {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if d, err := upnp.Discover(ctx); err != nil {
-			log.Println("WARN: couldn't discover UPnP device:", err)
-		} else {
-			_, portStr, _ := net.SplitHostPort(addr)
-			port, _ := strconv.Atoi(portStr)
-			if !d.IsForwarded(uint16(port), "TCP") {
-				if err := d.Forward(uint16(port), "TCP", "walletd"); err != nil {
-					log.Println("WARN: couldn't forward port:", err)
-				} else {
-					log.Println("p2p: Forwarded port", port)
-				}
-			}
-			if ip, err := d.ExternalIP(); err != nil {
-				log.Println("WARN: couldn't determine external IP:", err)
-			} else {
-				log.Println("p2p: External IP is", ip)
-				syncerAddr = net.JoinHostPort(ip, portStr)
-			}
+		var err error
+		network, genesisBlock, err = loadCustomNetwork(cfg.Consensus.Network)
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("invalid network: must be one of 'mainnet', 'zen', or 'anagami'")
+		} else if err != nil {
+			return fmt.Errorf("failed to load custom network: %w", err)
 		}
 	}
+
+	consensusDBPath := filepath.Join(cfg.Directory, "consensus.db")
+	_, existsErr := os.Open(consensusDBPath)
+	consensusExists := !errors.Is(existsErr, os.ErrNotExist)
+
+	chainOpts := []chain.ManagerOption{chain.WithLog(log.Named("chain"))}
+
+	var cm *chain.Manager
+	if cfg.Checkpoint != (types.ChainIndex{}) && !consensusExists {
+		log.Info("beginning instant sync", zap.Stringer("checkpoint", cfg.Checkpoint))
+		peers := append(cfg.Syncer.Peers, bootstrapPeers...)
+		cs, b, err := syncer.RetrieveCheckpoint(ctx, peers, cfg.Checkpoint, network, genesisBlock.ID())
+		if err != nil {
+			return fmt.Errorf("failed to retrieve checkpoint: %w", err)
+		}
+
+		bdb, err := coreutils.OpenBoltChainDB(consensusDBPath)
+		if err != nil {
+			return fmt.Errorf("failed to open consensus database: %w", err)
+		}
+		defer bdb.Close()
+
+		dbstore, err := chain.NewDBStoreAtCheckpoint(bdb, cs, b, chain.NewZapMigrationLogger(log.Named("chaindb")))
+		if err != nil {
+			return fmt.Errorf("failed to create chain store: %w", err)
+		}
+		cm = chain.NewManager(dbstore, chainOpts...)
+		if err := store.SetCheckpoint(cfg.Checkpoint); err != nil {
+			return fmt.Errorf("failed to set wallet db checkpoint: %w", err)
+		}
+		log.Info("instant sync successful", zap.Stringer("tip", cm.Tip()))
+	} else {
+		if cfg.Checkpoint != (types.ChainIndex{}) {
+			// checkpoint specified but consensus db already exists
+			log.Warn("skipping instant sync. consensus database already exists")
+		}
+
+		bdb, err := coreutils.OpenBoltChainDB(consensusDBPath)
+		if err != nil {
+			return fmt.Errorf("failed to open consensus database: %w", err)
+		}
+		defer bdb.Close()
+
+		dbstore, err := chain.NewDBStore(bdb, network, genesisBlock, chain.NewZapMigrationLogger(log.Named("chaindb")))
+		if err != nil {
+			return fmt.Errorf("failed to create chain store: %w", err)
+		}
+		cm = chain.NewManager(dbstore, chainOpts...)
+	}
+
+	syncerListener, err := net.Listen("tcp", cfg.Syncer.Address)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %q: %w", cfg.Syncer.Address, err)
+	}
+	defer syncerListener.Close()
+
+	httpListener, err := startLocalhostListener(cfg.HTTP.Address, log)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %q: %w", cfg.HTTP.Address, err)
+	}
+	defer httpListener.Close()
+
+	syncerAddr := syncerListener.Addr().String()
+	if cfg.Syncer.EnableUPnP {
+		_, portStr, _ := net.SplitHostPort(cfg.Syncer.Address)
+		port, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil {
+			return fmt.Errorf("failed to parse syncer port: %w", err)
+		}
+
+		ip, err := setupUPNP(context.Background(), uint16(port), log)
+		if err != nil {
+			log.Warn("failed to set up UPnP", zap.Error(err))
+		} else {
+			syncerAddr = net.JoinHostPort(ip, portStr)
+		}
+	}
+
 	// peers will reject us if our hostname is empty or unspecified, so use loopback
 	host, port, _ := net.SplitHostPort(syncerAddr)
 	if ip := net.ParseIP(host); ip == nil || ip.IsUnspecified() {
 		syncerAddr = net.JoinHostPort("127.0.0.1", port)
 	}
 
-	ps, err := syncerutil.NewJSONPeerStore(filepath.Join(dir, "peers.json"))
+	if cfg.Syncer.Bootstrap {
+		for _, peer := range bootstrapPeers {
+			if err := store.AddPeer(peer); err != nil {
+				return fmt.Errorf("failed to add bootstrap peer %q: %w", peer, err)
+			}
+		}
+		for _, peer := range cfg.Syncer.Peers {
+			if err := store.AddPeer(peer); err != nil {
+				return fmt.Errorf("failed to add peer %q: %w", peer, err)
+			}
+		}
+	}
+
+	ps, err := sqlite.NewPeerStore(store)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("failed to create peer store: %w", err)
 	}
-	for _, peer := range bootstrapPeers {
-		ps.AddPeer(peer)
-	}
+
 	header := gateway.Header{
 		GenesisID:  genesisBlock.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: syncerAddr,
 	}
-	s := syncer.New(l, cm, ps, header, syncer.WithLogger(log.Default()))
 
-	wm, err := walletutil.NewJSONWalletManager(dir, cm)
+	s := syncer.New(syncerListener, cm, ps, header, syncer.WithLogger(log.Named("syncer")))
+	defer s.Close()
+	go s.Run()
+
+	wm, err := wallet.NewManager(cm, store, wallet.WithLogger(log.Named("wallet")), wallet.WithIndexMode(cfg.Index.Mode), wallet.WithSyncBatchSize(cfg.Index.BatchSize))
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("failed to create wallet manager: %w", err)
 	}
+	defer wm.Close()
 
-	return &node{
-		cm: cm,
-		s:  s,
-		wm: wm,
-		Start: func() func() {
-			ch := make(chan struct{})
-			go func() {
-				s.Run()
-				close(ch)
-			}()
-			return func() {
-				l.Close()
-				<-ch
-				db.Close()
+	apiOpts := []api.ServerOption{
+		api.WithLogger(log.Named("api")),
+		api.WithPublicEndpoints(cfg.HTTP.PublicEndpoints),
+		api.WithBasicAuth(cfg.HTTP.Password),
+	}
+	if cfg.Debug {
+		apiOpts = append(apiOpts, api.WithDebug())
+	}
+	api := api.NewServer(store, cm, s, wm, apiOpts...)
+	web := walletd.Handler()
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api") {
+				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
+				api.ServeHTTP(w, r)
+				return
 			}
-		},
-	}, nil
+			web.ServeHTTP(w, r)
+		}),
+		ReadTimeout: 10 * time.Second,
+	}
+	defer server.Close()
+	go server.Serve(httpListener)
+
+	log.Info("node started", zap.String("network", network.Name), zap.Stringer("syncer", syncerListener.Addr()), zap.Stringer("http", httpListener.Addr()), zap.String("version", build.Version()), zap.String("commit", build.Commit()))
+	<-ctx.Done()
+	log.Info("shutting down")
+	return nil
 }
